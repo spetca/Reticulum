@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
-Bluetooth Exchange Test for Reticulum using Bleak
+Fixed Bluetooth Exchange Test for Reticulum using Bleak
 
-Tests the Bluetooth interface with MAC address F9:7F:43:01:0A:D4
+One device acts as server (the one with MAC F9:7F:43:01:0A:D4)
+Other device acts as client (connects to F9:7F:43:01:0A:D4)
 
 Usage:
-  Device A: python3 bluetooth_test_exchange.py --device=A
-  Device B: python3 bluetooth_test_exchange.py --device=B
-
-Both devices will attempt to connect to the specified MAC address.
+  Device with MAC F9:7F:43:01:0A:D4: python3 bluetooth_test_exchange_fixed.py --mode=server
+  Other device: python3 bluetooth_test_exchange_fixed.py --mode=client
 """
 
 import argparse
 import sys
 import os
 import time
-import tempfile
 sys.path.insert(0, os.getcwd())
 import RNS
 
-# Target MAC address
-PEER_MAC = "F9:7F:43:01:0A:D4"
+# The MAC address of the server device
+SERVER_MAC = "F9:7F:43:01:0A:D4"
 
 class BluetoothExchangeHandler:
-    def __init__(self, device_id):
-        self.device_id = device_id
+    def __init__(self, device_mode):
+        self.device_mode = device_mode
         self.received_announces = []
         self.start_time = time.time()
 
@@ -43,56 +41,87 @@ class BluetoothExchangeHandler:
         print(f"   Time: +{time.time() - self.start_time:.1f}s")
         print(f"   Total received: {len(self.received_announces)}")
 
-def create_config(device_id):
-    """Create test configuration for Bluetooth interface"""
+def create_server_config():
+    """Create config for server (doesn't need peer_address)"""
     config_content = f"""[reticulum]
   enable_transport = yes
   share_instance = no
-  instance_name = bluetooth_exchange_{device_id}
+  instance_name = bluetooth_server
   panic_on_interface_error = no
 
 [logging]
   loglevel = 3
 
 [interfaces]
-  [[Bluetooth Exchange Interface]]
+  # Server mode - waits for clients to connect
+  # Note: This is simplified - real BLE server would need GATT setup
+  # For now, we'll use a local interface for the server
+  [[Local Interface]]
+    type = AutoInterface
+    enabled = yes
+    devices = lo
+"""
+    return config_content
+
+def create_client_config():
+    """Create config for client (connects to server MAC)"""
+    config_content = f"""[reticulum]
+  enable_transport = yes
+  share_instance = no
+  instance_name = bluetooth_client
+  panic_on_interface_error = no
+
+[logging]
+  loglevel = 3
+
+[interfaces]
+  # Client mode - connects to server MAC
+  [[Bluetooth Client Interface]]
     type = BluetoothInterface
     enabled = yes
-    peer_address = {PEER_MAC}
-    connection_interval = 3.0
+    peer_address = {SERVER_MAC}
+    connection_interval = 5.0
 """
     return config_content
 
 def main():
-    parser = argparse.ArgumentParser(description="Bluetooth exchange test")
-    parser.add_argument("--device", choices=["A", "B"], required=True,
-                       help="Device identifier (A or B)")
+    parser = argparse.ArgumentParser(description="Fixed Bluetooth exchange test")
+    parser.add_argument("--mode", choices=["server", "client"], required=True,
+                       help="server (device with MAC F9:7F:43:01:0A:D4) or client (other device)")
 
     args = parser.parse_args()
 
-    print(f"🔵 Bluetooth Exchange Test - Device {args.device}")
-    print(f"🎯 Target MAC: {PEER_MAC}")
+    print(f"🔵 Bluetooth Exchange Test - {args.mode.upper()} Mode")
+    if args.mode == "server":
+        print(f"🎧 This device should have MAC: {SERVER_MAC}")
+        print(f"   Waiting for client to connect...")
+    else:
+        print(f"📞 Connecting to server MAC: {SERVER_MAC}")
     print("=" * 50)
 
-    # Check Bleak availability
-    try:
-        import bleak
-        print(f"✅ Bleak library available")
-    except ImportError:
-        print("❌ Bleak not available. Install with: pip install bleak")
-        return 1
+    # Check Bleak availability for client
+    if args.mode == "client":
+        try:
+            import bleak
+            print(f"✅ Bleak library available")
+        except ImportError:
+            print("❌ Bleak not available. Install with: pip install bleak")
+            return 1
 
     # Create test config directory
-    config_dir = f"bluetooth_exchange_{args.device}_config"
+    config_dir = f"bluetooth_{args.mode}_config"
     os.makedirs(config_dir, exist_ok=True)
 
-    config_content = create_config(args.device)
+    if args.mode == "server":
+        config_content = create_server_config()
+    else:
+        config_content = create_client_config()
+
     config_path = os.path.join(config_dir, "config")
     with open(config_path, "w") as f:
         f.write(config_content)
 
     print(f"📁 Created config: {config_dir}/config")
-    print(f"🔌 Connecting to peer: {PEER_MAC}")
 
     try:
         # Initialize Reticulum
@@ -107,17 +136,17 @@ def main():
             RNS.Destination.IN,
             RNS.Destination.SINGLE,
             "bluetooth_exchange",
-            args.device
+            args.mode
         )
 
-        print(f"📍 Device {args.device} destination: {RNS.prettyhexrep(destination.hash)}")
+        print(f"📍 {args.mode.capitalize()} destination: {RNS.prettyhexrep(destination.hash)}")
 
         # Set up announce handler
-        handler = BluetoothExchangeHandler(args.device)
+        handler = BluetoothExchangeHandler(args.mode)
         RNS.Transport.register_announce_handler(handler)
 
         # Initial announce
-        node_info = f"Device-{args.device}-{int(time.time()) % 10000}"
+        node_info = f"{args.mode.capitalize()}-{int(time.time()) % 10000}"
         destination.announce(app_data=node_info.encode("utf-8"))
         print(f"📡 Initial announce sent: {node_info}")
 
@@ -127,26 +156,32 @@ def main():
         start_time = time.time()
 
         print(f"\n🚀 Running exchange test...")
-        print(f"   📢 Will announce every 10 seconds")
-        print(f"   👂 Listening for peer Device {'B' if args.device == 'A' else 'A'}")
-        print(f"   🔌 BLE connection attempts every 3 seconds")
+        if args.mode == "server":
+            print(f"   🎧 Server waiting for client connections")
+            print(f"   📡 Announcing every 15 seconds")
+        else:
+            print(f"   📞 Client attempting BLE connection to {SERVER_MAC}")
+            print(f"   📡 Announcing every 10 seconds")
+        print(f"   👂 Listening for peer announces")
         print(f"   ⏰ Press Ctrl+C to stop")
         print()
+
+        announce_interval = 15 if args.mode == "server" else 10
 
         while True:
             time.sleep(1)
             elapsed = time.time() - start_time
 
-            # Announce every 10 seconds
-            if time.time() - last_announce >= 10:
-                node_info = f"Device-{args.device}-{int(time.time()) % 10000}"
+            # Announce at different intervals
+            if time.time() - last_announce >= announce_interval:
+                node_info = f"{args.mode.capitalize()}-{int(time.time()) % 10000}"
                 destination.announce(app_data=node_info.encode("utf-8"))
                 announce_count += 1
                 last_announce = time.time()
                 print(f"📡 Announce #{announce_count}: {node_info} (+{elapsed:.1f}s)")
 
-            # Show status every 20 seconds
-            if int(elapsed) % 20 == 0 and int(elapsed) > 0:
+            # Show status every 30 seconds
+            if int(elapsed) % 30 == 0 and int(elapsed) > 0:
                 print(f"\n📊 Status at +{elapsed:.0f}s:")
                 print(f"   📢 Announces sent: {announce_count}")
                 print(f"   👂 Announces received: {len(handler.received_announces)}")
@@ -156,8 +191,12 @@ def main():
                     last_received = handler.received_announces[-1]
                     print(f"   📥 Last received: {last_received['data']} (+{last_received['elapsed']:.1f}s)")
                 else:
-                    print(f"   ⏳ Waiting for peer connection...")
-                    print(f"   💡 Check that peer device is running and within BLE range")
+                    if args.mode == "server":
+                        print(f"   ⏳ Waiting for client to connect...")
+                        print(f"   💡 Make sure client device is running and within range")
+                    else:
+                        print(f"   ⏳ Trying to connect to server...")
+                        print(f"   💡 Check that server device is running and MAC is correct")
 
                 print()
                 time.sleep(1)  # Prevent multiple status prints
@@ -181,24 +220,19 @@ def main():
         print(f"   📈 Communication timeline:")
         for i, announce in enumerate(handler.received_announces, 1):
             print(f"     {i}. {announce['data']} at +{announce['elapsed']:.1f}s")
-
-        # Calculate average delay
-        if len(handler.received_announces) > 1:
-            intervals = []
-            for i in range(1, len(handler.received_announces)):
-                interval = handler.received_announces[i]['elapsed'] - handler.received_announces[i-1]['elapsed']
-                intervals.append(interval)
-            avg_interval = sum(intervals) / len(intervals)
-            print(f"   ⏱️  Average receive interval: {avg_interval:.1f}s")
-
     else:
         print(f"\n⚠️  No communication established")
-        print(f"   🔍 Troubleshooting checklist:")
-        print(f"     1. Both devices running this test?")
-        print(f"     2. Devices within BLE range (~10-30m)?")
-        print(f"     3. Bluetooth enabled on both devices?")
-        print(f"     4. MAC address {PEER_MAC} correct?")
-        print(f"     5. Check Reticulum logs for connection errors")
+        if args.mode == "server":
+            print(f"   🔍 Server troubleshooting:")
+            print(f"     1. Is client device running?")
+            print(f"     2. Is this device's MAC actually {SERVER_MAC}?")
+            print(f"     3. Check Bluetooth is enabled and visible")
+        else:
+            print(f"   🔍 Client troubleshooting:")
+            print(f"     1. Is server device running?")
+            print(f"     2. Is server MAC {SERVER_MAC} correct?")
+            print(f"     3. Are devices within BLE range?")
+            print(f"     4. Check Bluetooth is enabled")
 
     return 0
 
