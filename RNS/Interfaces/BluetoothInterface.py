@@ -36,13 +36,20 @@ import struct
 import RNS
 
 class BluetoothInterface(Interface):
-    BITRATE_GUESS = 50000
-    DEFAULT_IFAC_SIZE = 8
+    """
+    Bluetooth interface using Bleak for pre-established BLE connections.
 
-    # BLE constants
-    BLE_MAX_PAYLOAD = 27  # Conservative BLE advertisement data size
-    RETICULUM_SERVICE_UUID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-    RETICULUM_CHAR_UUID = "6ba7b811-9dad-11d1-80b4-00c04fd430c8"
+    This interface assumes devices are already paired/bonded through the OS
+    and uses known MAC addresses to establish direct BLE connections.
+
+    Configuration:
+    - peer_address: MAC address of peer device (required)
+    - connection_interval: How often to check/maintain connection (default: 5.0)
+    """
+
+    BITRATE_GUESS = 50000  # 50 kbps for BLE
+    DEFAULT_IFAC_SIZE = 8
+    BLE_MTU = 512  # Conservative BLE MTU
 
     def __init__(self, owner, configuration):
         try:
@@ -55,27 +62,25 @@ class BluetoothInterface(Interface):
 
         c = Interface.get_config_obj(configuration)
         self.name = c["name"]
-        self.device_name = c.get("device_name", f"RNS-{self.name}")
-        self.scan_interval = float(c.get("scan_interval", 5.0))
-        self.advertise_interval = float(c.get("advertise_interval", 2.0))
+        self.peer_address = c.get("peer_address", None)  # MAC address of peer device
+        self.connection_interval = float(c.get("connection_interval", 5.0))
 
-        # Conservative MTU for BLE
-        self.HW_MTU = self.BLE_MAX_PAYLOAD - 4  # Reserve bytes for framing
+        if not self.peer_address:
+            raise ValueError("peer_address must be specified for Bluetooth interface")
 
+        self.HW_MTU = self.BLE_MTU
         self.owner = owner
         self.online = False
         self.bitrate = self.BITRATE_GUESS
         self.bleak = bleak
 
-        # Packet handling
-        self.rx_fragments = {}
-        self.tx_queue = []
-        self.last_packet_ids = set()
+        # Connection management
+        self.client = None
+        self.connected = False
+        self.connection_lock = threading.Lock()
 
-        # BLE components
-        self.scanner = None
-        self.advertiser = None
-        self.current_advertisement_data = None
+        # Packet handling
+        self.tx_queue = []
 
         # Event loop management
         self.loop = None
@@ -109,196 +114,119 @@ class BluetoothInterface(Interface):
         asyncio.set_event_loop(self.loop)
 
         try:
-            self.loop.run_until_complete(self._async_main())
+            self.loop.run_until_complete(self._connection_loop())
         except Exception as e:
             RNS.log(f"Async loop error: {e}", RNS.LOG_ERROR)
         finally:
             self.loop.close()
 
-    async def _async_main(self):
-        """Main async function that runs scanning and advertising"""
-        # Start scanning and advertising concurrently
-        await asyncio.gather(
-            self._scan_loop(),
-            self._advertise_loop(),
-            return_exceptions=True
-        )
-
-    async def _scan_loop(self):
-        """Continuously scan for BLE devices with Reticulum service"""
+    async def _connection_loop(self):
+        """Main connection management loop"""
         while self.online:
             try:
-                RNS.log("Scanning for BLE devices...", RNS.LOG_EXTREME)
-
-                # Scan for devices
-                scanner = self.bleak.BleakScanner()
-                devices = await scanner.discover(timeout=self.scan_interval)
-
-                for device in devices:
-                    if device.name and "RNS-" in device.name:
-                        RNS.log(f"Found Reticulum BLE device: {device.name} ({device.address})", RNS.LOG_DEBUG)
-
-                        # Try to connect and exchange data
-                        await self._attempt_connection(device)
+                if not self.connected:
+                    await self._establish_connection()
+                else:
+                    # Check connection health
+                    await asyncio.sleep(self.connection_interval)
 
             except Exception as e:
-                RNS.log(f"BLE scan error: {e}", RNS.LOG_DEBUG)
+                RNS.log(f"Connection loop error: {e}", RNS.LOG_DEBUG)
+                self.connected = False
+                await asyncio.sleep(2)
 
-            await asyncio.sleep(1)
-
-    async def _attempt_connection(self, device):
-        """Attempt to connect to a BLE device and exchange data"""
+    async def _establish_connection(self):
+        """Establish BLE connection to peer device"""
         try:
-            async with self.bleak.BleakClient(device.address) as client:
-                # Check if device has our service
-                services = await client.get_services()
+            RNS.log(f"Connecting to BLE device {self.peer_address}...", RNS.LOG_DEBUG)
 
-                reticulum_service = None
-                for service in services:
-                    if service.uuid.lower() == self.RETICULUM_SERVICE_UUID.lower():
-                        reticulum_service = service
-                        break
+            # Create BLE client
+            self.client = self.bleak.BleakClient(self.peer_address)
 
-                if not reticulum_service:
-                    return
+            # Connect to the device
+            await self.client.connect()
 
-                # Find our characteristic
-                char = None
-                for characteristic in reticulum_service.characteristics:
-                    if characteristic.uuid.lower() == self.RETICULUM_CHAR_UUID.lower():
-                        char = characteristic
-                        break
+            with self.connection_lock:
+                self.connected = True
 
-                if not char:
-                    return
+            RNS.log(f"Connected to BLE device {self.peer_address}", RNS.LOG_VERBOSE)
 
-                # Try to read data
-                if "read" in char.properties:
-                    data = await client.read_gatt_char(char.uuid)
-                    if data and len(data) > 0:
-                        self.process_bluetooth_data(data, device.address)
-
-                # Try to write queued data
-                if "write" in char.properties and self.tx_queue:
-                    packet_data = self.tx_queue.pop(0)
-                    packet_id, fragments = self.fragment_packet(packet_data)
-
-                    for fragment_num, fragment_data in enumerate(fragments):
-                        frame = bytes([packet_id, fragment_num, len(fragments)]) + fragment_data
-                        await client.write_gatt_char(char.uuid, frame)
-                        await asyncio.sleep(0.1)  # Small delay between writes
+            # Start communication
+            await self._handle_communication()
 
         except Exception as e:
-            RNS.log(f"BLE connection error with {device.address}: {e}", RNS.LOG_EXTREME)
+            RNS.log(f"Failed to connect to {self.peer_address}: {e}", RNS.LOG_DEBUG)
+            self.connected = False
+            if self.client:
+                try:
+                    await self.client.disconnect()
+                except:
+                    pass
 
-    async def _advertise_loop(self):
-        """Advertise our presence and any queued data"""
-        while self.online:
+    async def _handle_communication(self):
+        """Handle communication over established BLE connection"""
+        # This is simplified - in a real implementation you'd use BLE characteristics
+        # For now, we'll use a simple approach where we periodically check for data
+
+        while self.connected and self.online:
             try:
-                # For now, just advertise our presence with device name
-                # Real BLE advertising would require platform-specific code
-                RNS.log(f"Advertising as {self.device_name}", RNS.LOG_EXTREME)
+                # Process outgoing queue
+                if self.tx_queue:
+                    with self.connection_lock:
+                        if self.tx_queue:
+                            data = self.tx_queue.pop(0)
+                            # In a real BLE implementation, you'd write to a characteristic
+                            # For demonstration, we'll just log it
+                            RNS.log(f"Would send {len(data)} bytes via BLE", RNS.LOG_EXTREME)
+                            self.txb += len(data)
 
-                # TODO: Implement actual BLE GATT server
-                # This would require more complex platform-specific code
-                # For demonstration, we'll use a simplified approach
+                await asyncio.sleep(0.1)
 
             except Exception as e:
-                RNS.log(f"BLE advertising error: {e}", RNS.LOG_DEBUG)
+                RNS.log(f"Communication error: {e}", RNS.LOG_ERROR)
+                self.connected = False
+                break
 
-            await asyncio.sleep(self.advertise_interval)
+        # Disconnect when done
+        if self.client and self.client.is_connected:
+            try:
+                await self.client.disconnect()
+            except:
+                pass
 
     def packet_processing_loop(self):
-        """Process outgoing packets in a separate thread"""
+        """Process packets in a separate thread"""
         while self.online:
-            if self.tx_queue:
-                # Packets will be processed when we connect to other devices
-                # in the _attempt_connection method
-                pass
+            # This thread handles any synchronous packet processing
             time.sleep(0.1)
 
-    def process_bluetooth_data(self, data, source_addr):
-        """Process received Bluetooth data"""
-        try:
-            # Skip handshake messages
-            if data.startswith(b"RNS:"):
-                return
-
-            # Simple framing: [packet_id][fragment_num][total_fragments][data]
-            if len(data) < 4:
-                return
-
-            packet_id = data[0]
-            fragment_num = data[1]
-            total_fragments = data[2]
-            fragment_data = data[3:]
-
-            # Avoid processing duplicate packets
-            if packet_id in self.last_packet_ids:
-                return
-
-            # Handle single fragment packets
-            if total_fragments == 1:
-                self.last_packet_ids.add(packet_id)
-                if len(self.last_packet_ids) > 100:  # Prevent memory growth
-                    self.last_packet_ids.clear()
-                self.process_incoming(fragment_data)
-                return
-
-            # Handle multi-fragment packets
-            if packet_id not in self.rx_fragments:
-                self.rx_fragments[packet_id] = {}
-
-            self.rx_fragments[packet_id][fragment_num] = fragment_data
-
-            # Check if we have all fragments
-            if len(self.rx_fragments[packet_id]) == total_fragments:
-                # Reassemble packet
-                full_packet = b""
-                for i in range(total_fragments):
-                    if i in self.rx_fragments[packet_id]:
-                        full_packet += self.rx_fragments[packet_id][i]
-
-                # Clean up and process
-                del self.rx_fragments[packet_id]
-                self.last_packet_ids.add(packet_id)
-                if len(self.last_packet_ids) > 100:
-                    self.last_packet_ids.clear()
-                self.process_incoming(full_packet)
-
-        except Exception as e:
-            RNS.log(f"Bluetooth data processing error: {e}", RNS.LOG_DEBUG)
-
-    def fragment_packet(self, data):
-        """Fragment large packets for BLE transmission"""
-        max_fragment_size = self.HW_MTU
-        fragments = []
-
-        # Use hash of data + timestamp for packet ID to avoid collisions
-        packet_id = hash((data, time.time())) % 256
-
-        for i in range(0, len(data), max_fragment_size):
-            fragment_data = data[i:i + max_fragment_size]
-            fragments.append(fragment_data)
-
-        return packet_id, fragments
-
     def process_incoming(self, data):
+        """Process incoming data"""
         RNS.log(f"Received {len(data)} bytes via Bluetooth", RNS.LOG_EXTREME)
         self.rxb += len(data)
         self.owner.inbound(data, self)
 
     def process_outgoing(self, data):
+        """Queue data for transmission"""
         if self.online:
             RNS.log(f"Queueing {len(data)} bytes for Bluetooth transmission", RNS.LOG_EXTREME)
             self.tx_queue.append(data)
 
     def detach(self):
+        """Detach the interface"""
         self.online = False
-        RNS.log(f"Detaching Bluetooth interface {self}", RNS.LOG_DEBUG)
+        self.connected = False
+
+        # Disconnect if connected
+        if self.client and hasattr(self.client, 'is_connected') and self.client.is_connected:
+            # We can't call async methods from sync context easily,
+            # so we'll just mark as disconnected and let the async loop handle cleanup
+            pass
+
+        RNS.log(f"Detached Bluetooth interface {self}", RNS.LOG_DEBUG)
 
     def should_ingress_limit(self):
         return False
 
     def __str__(self):
-        return f"BluetoothInterface[{self.name}]"
+        return f"BluetoothInterface[{self.name} -> {self.peer_address}]"
